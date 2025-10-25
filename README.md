@@ -5,6 +5,9 @@ A FastAPI-based middleware service for managing vLLM (virtual Large Language Mod
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104%2B-009688)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+
+> **Note:** This application is designed for Linux systems. It uses systemd for service management and is optimized for Linux-based environments.
 
 ## Features
 
@@ -247,6 +250,9 @@ Once running, access the interactive API documentation:
 
 ## System Requirements
 
+- **OS**: Linux (Ubuntu 20.04+, Debian, CentOS, or similar distributions)
+  - Uses systemd for service management
+  - Bash shell for installation scripts
 - **Python**: 3.8 or higher
 - **RAM**: Minimum 8GB (16GB+ recommended for larger models)
 - **GPU**: NVIDIA GPU with CUDA support (for vLLM inference)
