@@ -19,6 +19,18 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, HttpUrl
 
+# GPU monitoring
+try:
+    import pynvml
+    GPU_AVAILABLE = True
+    pynvml.nvmlInit()
+except ImportError:
+    GPU_AVAILABLE = False
+    print("Warning: pynvml not available. GPU monitoring will be disabled.")
+except Exception as e:
+    GPU_AVAILABLE = False
+    print(f"Warning: GPU monitoring unavailable: {e}")
+
 
 # Configuration
 MODELS_DIR = os.getenv("VLLM_MODELS_DIR", str(Path.home() / ".cache" / "huggingface" / "hub"))
@@ -26,9 +38,9 @@ VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_HOST = os.getenv("VLLM_HOST", "0.0.0.0")
 
 # Global state
-vllm_process: Optional[subprocess.Popen] = None
 current_model: Optional[str] = None
 context_window: Optional[int] = None
+SERVICE_NAME = "vllm.service"
 
 app = FastAPI(
     title="vLLM Manager",
@@ -41,7 +53,7 @@ app = FastAPI(
 class StartVLLMRequest(BaseModel):
     model_name: str
     gpu_memory_utilization: float = 0.9
-    max_model_len: Optional[int] = None
+    max_model_len: Optional[int] = 30000  # Default to 30k context window
     tensor_parallel_size: int = 1
     additional_args: Optional[Dict[str, Any]] = None
 
@@ -54,7 +66,7 @@ class DownloadModelRequest(BaseModel):
 class ModelSwitchRequest(BaseModel):
     model_name: str
     gpu_memory_utilization: float = 0.9
-    max_model_len: Optional[int] = None
+    max_model_len: Optional[int] = 30000  # Default to 30k context window
     tensor_parallel_size: int = 1
 
 
@@ -74,60 +86,148 @@ def get_disk_space():
         return {"error": str(e)}
 
 
-def find_vllm_process():
-    """Find any vLLM process running on the configured port"""
-    global vllm_process, current_model
+def get_gpu_info():
+    """Get GPU usage and memory information"""
+    if not GPU_AVAILABLE:
+        return None
+    
+    try:
+        device_count = pynvml.nvmlDeviceGetCount()
+        gpus = []
+        
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            
+            # Get GPU name
+            name_bytes = pynvml.nvmlDeviceGetName(handle)
+            name = name_bytes.decode('utf-8') if isinstance(name_bytes, bytes) else str(name_bytes)
+            
+            # Get memory info
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_memory = mem_info.total / (1024**3)  # Convert to GB
+            used_memory = mem_info.used / (1024**3)
+            free_memory = mem_info.free / (1024**3)
+            memory_percent = (mem_info.used / mem_info.total) * 100
+            
+            # Get utilization
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            gpu_utilization = util.gpu
+            memory_utilization = util.memory
+            
+            # Get temperature
+            try:
+                temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+            except:
+                temp = None
+            
+            # Get power usage
+            try:
+                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # Convert to watts
+            except:
+                power = None
+            
+            gpus.append({
+                "id": i,
+                "name": name,
+                "memory_total_gb": round(total_memory, 2),
+                "memory_used_gb": round(used_memory, 2),
+                "memory_free_gb": round(free_memory, 2),
+                "memory_percent": round(memory_percent, 1),
+                "gpu_utilization": gpu_utilization,
+                "memory_utilization": memory_utilization,
+                "temperature_c": temp,
+                "power_watts": power
+            })
+        
+        return {
+            "available": True,
+            "count": device_count,
+            "gpus": gpus
+        }
+    except Exception as e:
+        return {
+            "available": False,
+            "error": str(e)
+        }
 
-    # First check if we're tracking a process
-    if vllm_process is not None and vllm_process.poll() is None:
-        try:
-            proc = psutil.Process(vllm_process.pid)
-            return proc
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            vllm_process = None
 
-    # Search for any vLLM process on our port
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            cmdline = proc.info.get('cmdline')
-            if cmdline and 'vllm.entrypoints.openai.api_server' in ' '.join(cmdline):
-                # Check if it's using our port
-                if f'--port' in cmdline:
-                    port_idx = cmdline.index('--port')
-                    if port_idx + 1 < len(cmdline) and cmdline[port_idx + 1] == str(VLLM_PORT):
-                        # Found it! Extract model name
-                        if '--model' in cmdline:
-                            model_idx = cmdline.index('--model')
-                            if model_idx + 1 < len(cmdline):
-                                current_model = cmdline[model_idx + 1]
-                        return proc
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+def run_systemctl_command(action: str) -> tuple[bool, str]:
+    """Run systemctl command and return success status and output"""
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemctl', action, SERVICE_NAME],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.returncode == 0, result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out"
+    except Exception as e:
+        return False, str(e)
 
-    return None
+
+def get_service_status() -> tuple[bool, str]:
+    """Check if vLLM service is active"""
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', SERVICE_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        is_active = result.returncode == 0 and result.stdout.strip() == 'active'
+        return is_active, result.stdout.strip()
+    except Exception as e:
+        return False, str(e)
 
 
 def is_vllm_running():
-    """Check if vLLM process is running"""
-    return find_vllm_process() is not None
+    """Check if vLLM service is running"""
+    is_active, _ = get_service_status()
+    return is_active
 
 
 def get_vllm_process_info():
-    """Get detailed information about the vLLM process"""
-    proc = find_vllm_process()
-    if proc is None:
+    """Get detailed information about the vLLM service"""
+    is_active, status = get_service_status()
+    if not is_active:
         return None
 
     try:
+        # Get service status details
+        result = subprocess.run(
+            ['systemctl', 'show', SERVICE_NAME, '--property=MainPID,ActiveState,SubState'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode != 0:
+            return None
+            
+        # Parse systemctl output
+        properties = {}
+        for line in result.stdout.strip().split('\n'):
+            if '=' in line:
+                key, value = line.split('=', 1)
+                properties[key] = value
+        
+        pid = int(properties.get('MainPID', '0'))
+        if pid == 0:
+            return None
+            
+        # Get process info using psutil
+        proc = psutil.Process(pid)
         return {
-            "pid": proc.pid,
-            "status": proc.status(),
+            "pid": pid,
+            "status": properties.get('SubState', 'unknown'),
             "cpu_percent": proc.cpu_percent(interval=0.1),
             "memory_mb": round(proc.memory_info().rss / (1024**2), 2),
             "create_time": datetime.fromtimestamp(proc.create_time()).isoformat(),
             "model": current_model
         }
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, subprocess.TimeoutExpired):
         return None
 
 
@@ -336,6 +436,16 @@ async def root():
             transition: border 0.3s;
         }
 
+        input[type="number"] {
+            -moz-appearance: textfield;
+        }
+
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
         select {
             min-width: 100%;
             max-width: 100%;
@@ -506,8 +616,16 @@ async def root():
                     <div class="status-value" id="cpuUsage">-</div>
                 </div>
                 <div class="status-item">
+                    <div class="status-label">GPU Usage</div>
+                    <div class="status-value" id="gpuUsage">-</div>
+                </div>
+                <div class="status-item">
                     <div class="status-label">Memory</div>
                     <div class="status-value" id="memoryUsage">-</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">GPU Memory</div>
+                    <div class="status-value" id="gpuMemory">-</div>
                 </div>
                 <div class="status-item">
                     <div class="status-label">Free Disk</div>
@@ -522,6 +640,10 @@ async def root():
 
         <div class="section">
             <div class="section-title">Control Panel</div>
+            <div class="input-group">
+                <label for="startContextWindow">Context Window (for new start):</label>
+                <input type="number" id="startContextWindow" placeholder="30000" min="1024" max="100000" step="1024" />
+            </div>
             <div class="button-group">
                 <button class="btn-start" onclick="startVLLM()">▶ Start vLLM</button>
                 <button class="btn-stop" onclick="stopVLLM()">■ Stop vLLM</button>
@@ -536,6 +658,10 @@ async def root():
                 <select id="modelSelect">
                     <option value="">Loading models...</option>
                 </select>
+            </div>
+            <div class="input-group">
+                <label for="contextWindow">Context Window:</label>
+                <input type="number" id="contextWindow" placeholder="30000" min="1024" max="100000" step="1024" />
             </div>
             <div class="button-group">
                 <button class="btn-switch" onclick="switchModel()">Switch Model</button>
@@ -608,12 +734,32 @@ async def root():
                     document.getElementById('memoryUsage').textContent = '-';
                 }
 
+                // Update GPU information
+                if (data.gpu_info && data.gpu_info.available && data.gpu_info.gpus.length > 0) {
+                    const gpu = data.gpu_info.gpus[0]; // Use first GPU for display
+                    document.getElementById('gpuUsage').textContent = gpu.gpu_utilization + '%';
+                    document.getElementById('gpuMemory').textContent = gpu.memory_used_gb.toFixed(1) + ' / ' + gpu.memory_total_gb.toFixed(1) + ' GB';
+                } else {
+                    document.getElementById('gpuUsage').textContent = '-';
+                    document.getElementById('gpuMemory').textContent = '-';
+                }
+
                 if (data.disk_space) {
                     document.getElementById('freeDisk').textContent = data.disk_space.free_gb + ' GB';
                 }
 
                 // Update context window
                 document.getElementById('contextWindow').textContent = data.context_window || '-';
+                
+                // Update context window input fields
+                if (data.context_window) {
+                    const contextValue = data.context_window.replace(/,/g, '');
+                    document.getElementById('startContextWindow').value = contextValue;
+                    document.getElementById('contextWindow').value = contextValue;
+                } else {
+                    document.getElementById('startContextWindow').value = '30000';
+                    document.getElementById('contextWindow').value = '30000';
+                }
 
                 // Load models
                 const modelsResponse = await fetch('/models');
@@ -651,6 +797,8 @@ async def root():
                 return;
             }
 
+            const contextWindow = document.getElementById('startContextWindow').value || 30000;
+
             showLoading(true);
             showProgress(true, 'Starting vLLM...', 10);
 
@@ -662,7 +810,7 @@ async def root():
                     body: JSON.stringify({
                         model_name: modelName.replace('models--', '').replace('--', '/'),
                         gpu_memory_utilization: 0.85,
-                        max_model_len: 4096
+                        max_model_len: parseInt(contextWindow)
                     })
                 });
 
@@ -713,6 +861,8 @@ async def root():
                 return;
             }
 
+            const contextWindow = document.getElementById('contextWindow').value || 30000;
+
             showLoading(true);
             showProgress(true, 'Stopping current model...', 10);
 
@@ -726,7 +876,8 @@ async def root():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         model_name: modelName.replace('models--', '').replace('--', '/'),
-                        gpu_memory_utilization: 0.85
+                        gpu_memory_utilization: 0.85,
+                        max_model_len: parseInt(contextWindow)
                     })
                 });
 
@@ -848,6 +999,7 @@ async def get_status():
         "context_window": ctx_window,
         "process_info": get_vllm_process_info(),
         "disk_space": get_disk_space(),
+        "gpu_info": get_gpu_info(),
         "vllm_port": VLLM_PORT,
         "models_dir": MODELS_DIR
     }
@@ -855,102 +1007,83 @@ async def get_status():
 
 @app.post("/start")
 async def start_vllm(request: StartVLLMRequest):
-    """Start vLLM server with specified model"""
-    global vllm_process, current_model, context_window
+    """Start vLLM service with specified model"""
+    global current_model, context_window
 
     if is_vllm_running():
         raise HTTPException(
             status_code=400,
-            detail=f"vLLM is already running with model: {current_model}"
+            detail=f"vLLM service is already running with model: {current_model}"
         )
 
-    # Build vLLM command
-    cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", request.model_name,
-        "--host", VLLM_HOST,
-        "--port", str(VLLM_PORT),
-        "--gpu-memory-utilization", str(request.gpu_memory_utilization),
-    ]
-
-    if request.max_model_len:
-        cmd.extend(["--max-model-len", str(request.max_model_len)])
-
-    if request.tensor_parallel_size > 1:
-        cmd.extend(["--tensor-parallel-size", str(request.tensor_parallel_size)])
-
-    # Add additional arguments
-    if request.additional_args:
-        for key, value in request.additional_args.items():
-            cmd.extend([f"--{key.replace('_', '-')}", str(value)])
-
+    # Update the service file with new parameters if needed
+    # For now, we'll just start the existing service
+    # In a production setup, you might want to dynamically update the service file
+    
     try:
-        # Start vLLM process
-        vllm_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        # Start the vLLM service
+        success, output = run_systemctl_command("start")
+        
+        if not success:
+            raise HTTPException(status_code=500, detail=f"Failed to start vLLM service: {output}")
+        
+        # Update global state
         current_model = request.model_name
         context_window = request.max_model_len
 
         # Wait a moment to check if it started successfully
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         if not is_vllm_running():
-            stderr = vllm_process.stderr.read() if vllm_process.stderr else "Unknown error"
-            raise HTTPException(status_code=500, detail=f"vLLM failed to start: {stderr}")
+            raise HTTPException(status_code=500, detail="vLLM service failed to start")
 
         return {
             "status": "started",
             "model": current_model,
-            "pid": vllm_process.pid,
+            "service": SERVICE_NAME,
             "port": VLLM_PORT,
-            "command": " ".join(cmd)
+            "message": "vLLM service started successfully"
         }
     except Exception as e:
-        vllm_process = None
         current_model = None
-        raise HTTPException(status_code=500, detail=f"Failed to start vLLM: {str(e)}")
+        context_window = None
+        raise HTTPException(status_code=500, detail=f"Failed to start vLLM service: {str(e)}")
 
 
 @app.post("/stop")
 async def stop_vllm():
-    """Stop the running vLLM server"""
-    global vllm_process, current_model
+    """Stop the running vLLM service"""
+    global current_model
 
-    proc = find_vllm_process()
-    if proc is None:
-        raise HTTPException(status_code=400, detail="vLLM is not running")
+    if not is_vllm_running():
+        raise HTTPException(status_code=400, detail="vLLM service is not running")
 
     try:
         old_model = current_model
 
-        # Try graceful shutdown first
-        proc.terminate()
+        # Stop the vLLM service
+        success, output = run_systemctl_command("stop")
+        
+        if not success:
+            raise HTTPException(status_code=500, detail=f"Failed to stop vLLM service: {output}")
 
-        # Wait up to 10 seconds for graceful shutdown
+        # Wait for service to stop
         for _ in range(10):
             if not is_vllm_running():
                 break
             await asyncio.sleep(1)
 
-        # Force kill if still running
-        if is_vllm_running():
-            proc.kill()
-            await asyncio.sleep(1)
-
-        vllm_process = None
         current_model = None
+        context_window = None
 
         return {
             "status": "stopped",
             "model": old_model,
-            "message": "vLLM server has been stopped"
+            "service": SERVICE_NAME,
+            "message": "vLLM service has been stopped"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to stop vLLM: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop vLLM service: {str(e)}")
 
 
 @app.post("/restart")
@@ -1100,6 +1233,15 @@ async def delete_model(request: dict):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete: {str(e)}")
+
+
+@app.get("/gpu")
+async def get_gpu_status():
+    """Get detailed GPU information"""
+    gpu_info = get_gpu_info()
+    if gpu_info is None:
+        raise HTTPException(status_code=503, detail="GPU monitoring not available")
+    return gpu_info
 
 
 @app.get("/health")
